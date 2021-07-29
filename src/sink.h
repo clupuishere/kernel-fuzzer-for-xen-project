@@ -69,6 +69,9 @@ static struct sink sinks[] = {
      * without having to recompile the target with an endharness in place.
      */
     //{ .function = "printk", .ignore = 1 },
+
+    /* Unikraft */
+    { .function = "do_page_fault" },
 };
 
 #endif

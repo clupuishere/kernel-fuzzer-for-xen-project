@@ -9,6 +9,7 @@ static const char *traptype[] = {
     [VMI_EVENT_CPUID] = "cpuid",
     [VMI_EVENT_INTERRUPT] = "int3",
     [VMI_EVENT_MEMORY] = "ept",
+    [VMI_EVENT_GUEST_REQUEST] = "guest_request",
 };
 static vmi_event_t singlestep_event, int3_event, cpuid_event, ept_event;
 
@@ -33,8 +34,51 @@ static addr_t next_cf_paddr;
 static uint8_t cc = 0xCC;
 static uint8_t cf_backup;
 
+extern int xc_cloning_cow(xc_interface *xch, uint32_t domid, void *addr, unsigned long *mfn);
+
+int pv_cow(vmi_instance_t vmi, uint32_t domid, addr_t vaddr, addr_t *paddr)
+{
+    unsigned long new_mfn;
+    page_info_t info;
+    int rc;
+
+    rc = xc_cloning_cow(xc, domid, (void *) vaddr, &new_mfn);
+    if ( rc && errno != ESRCH )
+    {
+        fprintf(stderr, "Error calling xc_cloning_cow() rc=%d errno=%d\n",
+                rc, errno);
+        goto out;
+    }
+
+    if ( paddr )
+    {
+        rc = vmi_pagetable_lookup_extended(vmi, target_pagetable, vaddr, &info);
+        if ( rc == VMI_FAILURE )
+        {
+            printf("Failed to lookup COWed instruction PA for 0x%lx with PT 0x%lx\n",
+                    vaddr, target_pagetable);
+            goto out;
+        }
+
+        if ( debug )
+            printf("[TRACER] COW: va=0x%lx 0x%lx -> 0x%lx\n",
+                    vaddr, *paddr, info.paddr);
+
+        *paddr = info.paddr;
+    }
+
+out:
+    return rc;
+}
+
 static void breakpoint_next_cf(vmi_instance_t vmi)
 {
+    if ( xen_is_pv(vmi) )
+    {
+        if ( VMI_SUCCESS != pv_cow(vmi, fuzzdomid, next_cf_vaddr, &next_cf_paddr) )
+            return;
+    }
+
     if ( VMI_SUCCESS == vmi_read_pa(vmi, next_cf_paddr, 1, &cf_backup, NULL) &&
          VMI_SUCCESS == vmi_write_pa(vmi, next_cf_paddr, 1, &cc, NULL) )
     {
@@ -160,7 +204,8 @@ static bool check_if_sink(vmi_instance_t vmi, vmi_event_t *event, event_response
     {
         struct sink *s = (struct sink*)tmp->data;
 
-        if ( s->paddr && s->paddr == rip_pa )
+        if ( (vm_is_pv && s->vaddr && s->vaddr == rip_pa) ||
+                         (s->paddr && s->paddr == rip_pa) )
         {
             vmi_pause_vm(vmi);
             interrupted = 1;
@@ -217,6 +262,21 @@ static event_response_t tracer_cb(vmi_instance_t vmi, vmi_event_t *event)
 
         event->x86_regs->rip += event->cpuid_event.insn_length;
         return VMI_EVENT_RESPONSE_SET_REGISTERS;
+    }
+    else if ( VMI_EVENT_GUEST_REQUEST == event->type )
+    {
+        // Harness signal on finish
+        if ( debug ) printf("VMI_EVENT_GUEST_REQUEST\n");
+        vmi_pause_vm(vmi);
+
+        interrupted = 1;
+
+        if ( doublefetch_trip )
+            crash = 1;
+
+        if ( debug ) printf("\t Harness signal on finish\n");
+
+        return 0;
     }
 
     /* We are still running */
@@ -366,6 +426,17 @@ bool setup_trace(vmi_instance_t vmi)
         cpuid_event.callback = tracer_cb;
 
         if ( VMI_FAILURE == vmi_register_event(vmi, &cpuid_event) )
+            return false;
+    }
+
+    if (xen_is_pv(vmi)) {
+        static vmi_event_t guest_request_event;
+
+        guest_request_event.version = VMI_EVENTS_VERSION;
+        guest_request_event.type = VMI_EVENT_GUEST_REQUEST;
+        guest_request_event.callback = tracer_cb;
+
+        if (VMI_FAILURE == vmi_register_event(vmi, &guest_request_event))
             return false;
     }
 
@@ -593,6 +664,15 @@ bool make_sink_ready(void)
             goto done;
         }
 
+        if ( xen_is_pv(sink_vmi) )
+        {
+            if ( VMI_SUCCESS != pv_cow(sink_vmi, sinkdomid, s->vaddr, &s->paddr) )
+            {
+                if ( debug ) printf("Failed to COW %s\n", s->function);
+                goto done;
+            }
+        }
+
         if ( VMI_FAILURE == vmi_write_pa(sink_vmi, s->paddr, 1, &cc, NULL) )
         {
             if ( debug ) printf("Failed to write %s PA 0x%lx\n", s->function, s->paddr);
@@ -604,6 +684,7 @@ bool make_sink_ready(void)
                    s->function, s->vaddr, s->paddr);
     }
 
+    if ( !xen_is_pv(sink_vmi) )
     unset_hvm_params();
 
     if ( debug ) printf("Sinks are ready\n");

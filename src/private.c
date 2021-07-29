@@ -30,6 +30,7 @@ GHashTable *memaccess;
 
 xc_interface *xc;
 vmi_instance_t parent_vmi, vmi;
+bool vm_is_pv;
 os_t os;
 addr_t target_pagetable;
 addr_t start_rip;

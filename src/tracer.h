@@ -13,4 +13,6 @@ bool setup_trace(vmi_instance_t vmi);
 bool start_trace(vmi_instance_t vmi, addr_t address);
 void close_trace(vmi_instance_t vmi);
 
+int pv_cow(vmi_instance_t vmi, uint32_t domid, addr_t vaddr, addr_t *paddr);
+
 #endif

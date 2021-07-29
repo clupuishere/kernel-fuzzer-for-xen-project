@@ -51,6 +51,7 @@ extern GHashTable *memaccess;
 
 extern xc_interface *xc;
 extern vmi_instance_t vmi;
+extern bool vm_is_pv;
 extern os_t os;
 extern addr_t target_pagetable;
 extern addr_t start_rip;

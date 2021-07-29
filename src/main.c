@@ -34,6 +34,8 @@ static void get_input(void)
     if ( debug ) printf("Got input size %lu\n", input_size);
 }
 
+extern int xc_cloning_reset(xc_interface *xch, uint32_t domid);
+
 static bool inject_input(vmi_instance_t vmi)
 {
     if ( !input || !input_size )
@@ -47,6 +49,12 @@ static bool inject_input(vmi_instance_t vmi)
 
     if ( debug ) printf("Writing %lu bytes of input to 0x%lx\n", input_size, address);
 
+    if ( vm_is_pv )
+    {
+        if ( VMI_SUCCESS != pv_cow(vmi, fuzzdomid, address, NULL) )
+            return false;
+    }
+
     return VMI_SUCCESS == vmi_write(vmi, &ctx, input_size, input, NULL);
 }
 
@@ -55,7 +63,7 @@ static bool make_fuzz_ready()
     if ( !fuzzdomid )
         return false;
 
-    if ( !setup_vmi(&vmi, NULL, fuzzdomid, NULL, true, true) )
+    if ( !setup_vmi(&vmi, NULL, fuzzdomid, json, true, true) )
     {
         fprintf(stderr, "Unable to start VMI on fuzz domain %u\n", fuzzdomid);
         return false;
@@ -79,6 +87,12 @@ static bool fuzz(void)
     if ( !fuzzdomid )
         return false;
 
+    if ( vm_is_pv )
+    {
+        if ( xc_cloning_reset(xc, fuzzdomid) )
+            return false;
+    }
+    else
     if ( xc_memshr_fork_reset(xc, fuzzdomid) )
         return false;
 
@@ -109,6 +123,9 @@ static bool fuzz(void)
         decode_pt();
 
     vmi_pagecache_flush(vmi);
+    if ( vm_is_pv )
+        vmi_v2pcache_flush(vmi, ~0ull);
+    else
     vmi_v2pcache_flush(vmi, target_pagetable);
     vmi_pidcache_flush(vmi);
     vmi_rvacache_flush(vmi);
@@ -236,9 +253,10 @@ int main(int argc, char** argv)
         {"sink-paddr", required_argument, NULL, 'P'},
         {"record-codecov", required_argument, NULL, 'R'},
         {"record-memaccess", required_argument, NULL, 'M'},
+        {"os", required_argument, NULL, 'o'},
         {NULL, 0, NULL, 0}
     };
-    const char* opts = "d:i:j:f:a:l:F:H:S:m:n:V:P:R:M:svchtOKND";
+    const char* opts = "d:i:j:f:a:l:F:H:S:m:n:V:P:R:M:svchtOKNDo:";
     limit = ~0;
     unsigned long refork = 0;
     bool keep = false;
@@ -345,6 +363,9 @@ int main(int argc, char** argv)
         case 'M':
             record_memaccess = optarg;
             break;
+        case 'o':
+            libvmi_default_os = optarg;
+            break;
         case 'h': /* fall-through */
         default:
             usage();
@@ -410,6 +431,52 @@ int main(int argc, char** argv)
      *
      * Fuzzing is performed from a further fork made from sinkdomid, in fuzzdomid.
      */
+    if ( vm_is_pv )
+    {
+        int rc;
+
+        rc = xc_domain_fuzzing_enable(xc, domid);
+        if (rc) {
+            perror("Error calling xc_domain_fuzzing_enable()");
+            goto done;
+        }
+
+        rc = xc_cloning_clone_single(xc, domid, &sinkdomid);
+        if (rc) {
+            perror("Error calling xc_cloning_clone_single()");
+            goto done;
+        }
+
+        rc = xc_domain_fuzzing_enable(xc, sinkdomid);
+        if (rc) {
+            perror("Error calling xc_domain_fuzzing_enable()");
+            goto done;
+        }
+
+        /*
+         * We need to set the sinks before forking the sink domain
+         * in order to have them on the fuzz domain by default
+         */
+        if ( !make_sink_ready() )
+        {
+            fprintf(stderr, "Seting up sinks on VM fork domid %u failed\n", sinkdomid);
+            goto done;
+        }
+
+        rc = xc_cloning_clone_single(xc, sinkdomid, &fuzzdomid);
+        if (rc) {
+            perror("Error calling xc_cloning_clone_single()");
+            goto done;
+        }
+
+        rc = xc_domain_fuzzing_enable(xc, fuzzdomid);
+        if (rc) {
+            perror("Error calling xc_domain_fuzzing_enable()");
+            goto done;
+        }
+    }
+    else
+    {
     if ( !fork_vm(domid, &sinkdomid) )
     {
         fprintf(stderr, "Domain fork failed, sink domain not up\n");
@@ -420,6 +487,7 @@ int main(int argc, char** argv)
     {
         fprintf(stderr, "Domain fork failed, fuzz domain not up\n");
         goto done;
+    }
     }
 
     afl_setup();
@@ -439,6 +507,7 @@ int main(int argc, char** argv)
 
     input_file = NULL;
 
+    if ( !vm_is_pv )
     if ( !make_sink_ready() )
     {
         fprintf(stderr, "Seting up sinks on VM fork domid %u failed\n", sinkdomid);

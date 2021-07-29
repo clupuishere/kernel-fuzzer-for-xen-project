@@ -11,7 +11,7 @@ extern unsigned int magic_mark;
 
 #define extended_mark_cookie (UINT64_C(0x13371337) << 32)
 
-static vmi_event_t cpuid_event, cc_event;
+static vmi_event_t cpuid_event, cc_event, guest_request_event;
 static addr_t rip;
 
 static void cpuid_done(vmi_instance_t vmi, vmi_event_t *event)
@@ -72,6 +72,19 @@ static event_response_t start_cpuid_cb(vmi_instance_t vmi, vmi_event_t *event)
     return VMI_EVENT_RESPONSE_SET_REGISTERS;
 }
 
+static event_response_t start_guest_request_cb(vmi_instance_t vmi, vmi_event_t *event)
+{
+    rip = event->x86_regs->rip + event->cpuid_event.insn_length;
+
+    printf("Got start event for harness rip=%lx\n", rip);
+
+    cpuid_done(vmi, event);
+
+    event->x86_regs->rip = rip;
+
+    return VMI_EVENT_RESPONSE_SET_REGISTERS;
+}
+
 static event_response_t start_cc_cb(vmi_instance_t vmi, vmi_event_t *event)
 {
     addr_t pa = (event->interrupt_event.gfn << 12) + event->interrupt_event.offset;
@@ -101,6 +114,17 @@ static event_response_t start_cc_cb(vmi_instance_t vmi, vmi_event_t *event)
 
 static void waitfor_start(vmi_instance_t vmi)
 {
+    if (xen_is_pv(vmi)) {
+        guest_request_event.version = VMI_EVENTS_VERSION;
+        guest_request_event.type = VMI_EVENT_GUEST_REQUEST;
+        guest_request_event.callback = start_guest_request_cb;
+
+        if (VMI_FAILURE == vmi_register_event(vmi, &guest_request_event))
+            return;
+
+        printf("Waiting for harness start (pv)\n");
+
+    } else
     if ( harness_cpuid )
     {
         cpuid_event.version = VMI_EVENTS_VERSION;
@@ -160,6 +184,8 @@ bool make_parent_ready(void)
           printf("Auto inferred Input address=0x%lx, input-limit=%zu\n", address, input_limit);
     } else
         parent_ready = true;
+
+    vm_is_pv = xen_is_pv(parent_vmi);
 
     vmi_destroy(parent_vmi);
     parent_vmi = NULL;
