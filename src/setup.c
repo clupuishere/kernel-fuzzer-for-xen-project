@@ -158,7 +158,7 @@ bool make_parent_ready(void)
 
     if ( !setup_vmi(&parent_vmi, domain, domid, NULL, setup, false) )
     {
-        fprintf(stderr, "Unable to start VMI on domain\n");
+        fprintf(stderr, "Unable to start VMI on domain %d\n", domid);
         return false;
     }
 

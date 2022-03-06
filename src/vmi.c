@@ -13,16 +13,18 @@ extern vmi_instance_t vmi;
 
 bool setup_vmi(vmi_instance_t *vmi, char* domain, uint64_t domid, char* json, bool init_events, bool init_paging)
 {
-    printf("Init vmi, init_events: %i init_paging %i domain %s domid %lu json %s\n",
+    fprintf(stderr, "Init vmi, init_events: %i init_paging %i domain %s domid %lu json %s\n",
            init_events, init_paging, domain, domid, json);
 
     vmi_mode_t mode = (init_events ? VMI_INIT_EVENTS : 0) |
                       (domain ? VMI_INIT_DOMAINNAME : VMI_INIT_DOMAINID);
 
     const void *d = domain ?: (void*)&domid;
-
-    if ( VMI_FAILURE == vmi_init(vmi, VMI_XEN, d, mode, NULL, NULL) )
+    vmi_init_error_t error;
+    if ( VMI_FAILURE == vmi_init(vmi, VMI_XEN, d, mode, NULL, &error) ) {
+     	fprintf(stderr, "Error in vmi_init with error %d\n", error);
         return false;
+    }
 
     if ( json )
     {

@@ -72,6 +72,7 @@ static struct sink sinks[] = {
 
     /* Unikraft */
     { .function = "do_page_fault" },
+    { .function = "ukplat_terminate" },
 };
 
 #endif

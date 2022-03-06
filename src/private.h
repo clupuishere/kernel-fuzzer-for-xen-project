@@ -38,6 +38,7 @@ extern bool afl;
 extern bool parent_ready;
 extern bool crash;
 extern bool setup;
+extern bool no_cloning; // add for Unikraft no cloning
 extern bool debug;
 extern bool loopmode;
 extern bool nocov;
@@ -66,7 +67,7 @@ extern unsigned int magic_mark;
 extern uint8_t start_byte;
 
 extern csh cs_handle;
-
+extern struct xs_handle* handle;
 extern bool builtin_list;
 extern GSList *sink_list;
 

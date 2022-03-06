@@ -2,7 +2,89 @@
  * Copyright (C) 2020 Intel Corporation
  * SPDX-License-Identifier: MIT
  */
+
 #include "private.h"
+
+#if defined(FZ_LINUX)
+#include <errno.h>
+#include <sys/syscall.h>
+#else
+#include <xen/xen.h>
+#include <xenstore.h>
+//#include <xenbus/xs.h>
+//#include <xenbus/client.h>
+#endif /* FZ_LINUX */
+
+
+#define GET_TIME(start) (clock_gettime(CLOCK_REALTIME, &(start)))
+#define TIME_DIFF(start, stop) ((stop.tv_sec - start.tv_sec) + ( stop.tv_nsec - start.tv_nsec )/ 1000000000.0);
+
+static int wait_ready(void)
+{
+   struct timespec start, stop;
+   int rc;
+   static const char* data_path = "/data/ready-path";
+
+   if (handle == NULL) {
+	handle = xs_open(0);
+	 if (handle == NULL) {
+	    fprintf(stderr, "Handle is null\n");
+	    return -1;
+         }
+   }
+
+   char* path = xs_get_domain_path(handle, domid + 1);
+   if (!path) {
+      fprintf(stderr, "xs_domain_path() failed\n");
+      return -1;
+   }
+
+   char* tmp = realloc(path, strlen(path) + strlen(data_path) + 1);
+   if (!tmp) {
+      fprintf(stderr, "realloc() failed");
+      return -1;
+   }
+
+   path = tmp;
+   strcat(path, data_path);
+    
+   rc = xs_watch(handle, path, "done");
+   int fd = xs_fileno(handle);
+   fd_set set;
+   int num_strings;
+   char **vec;
+   // TODO: clock_get_time -> MACROS pentru masurat timp Expected: 30 ms
+   while(1) {
+   	 GET_TIME(start);
+     	 FD_ZERO(&set);
+	 FD_SET(fd, &set);
+	 if (select(fd + 1, &set, NULL, NULL, NULL) > 0 && FD_ISSET(fd, &set)) {
+	   GET_TIME(stop);
+	   double  time_diff = TIME_DIFF(start, stop);
+	   fprintf(stderr, "select time %lf\n", time_diff);
+           vec = xs_read_watch(handle, &num_strings);
+	   if (!vec) {
+		fprintf(stderr, "xs_read_watch failed\n");
+	   }
+	   
+	   //xs_transaction_t th;
+	   unsigned int len;
+	   //th = xs_transaction_start(handle);
+	   char *buf = xs_read(handle, XBT_NULL, vec[XS_WATCH_PATH], &len);
+	   if (buf) {
+		if (!strcmp(buf, "done")) {
+		  break;
+		}
+	   }
+	   //xs_transaction_end(handle, th, false);
+	 }
+
+   }
+
+   free(path);
+   return rc;
+
+}
 
 static void get_input(void)
 {
@@ -32,6 +114,7 @@ static void get_input(void)
     input_file = NULL;
 
     if ( debug ) printf("Got input size %lu\n", input_size);
+
 }
 
 extern int xc_cloning_reset(xc_interface *xch, uint32_t domid);
@@ -47,14 +130,16 @@ static bool inject_input(vmi_instance_t vmi)
         .addr = address
     );
 
-    if ( debug ) printf("Writing %lu bytes of input to 0x%lx\n", input_size, address);
-
-    if ( vm_is_pv )
-    {
-        if ( VMI_SUCCESS != pv_cow(vmi, fuzzdomid, address, NULL) )
-            return false;
+   if ( debug ) fprintf(stdout, "Writing %lu bytes of input to 0x%lx\n", input_size, address);
+   
+     if ( vm_is_pv && (no_cloning == false))
+     {
+		if ( VMI_SUCCESS != pv_cow(vmi, fuzzdomid, address, NULL) ) {
+			return false;
+		}
     }
 
+    if (debug) printf("Before return\n");
     return VMI_SUCCESS == vmi_write(vmi, &ctx, input_size, input, NULL);
 }
 
@@ -69,6 +154,7 @@ static bool make_fuzz_ready()
         return false;
     }
 
+    // TODO: check if ptcov is enabled
     if ( ptcov && !setup_pt() )
     {
         fprintf(stderr, "Failed to enable Processor Tracing\n");
@@ -77,25 +163,42 @@ static bool make_fuzz_ready()
 
     setup_trace(vmi);
 
-    if ( debug ) printf("VM Fork is ready for fuzzing\n");
+    if ( debug ) fprintf(stderr, "VM Fork is ready for fuzzing\n");
 
     return true;
 }
 
+static void* setup_vm(__attribute__((unused)) void *arg) {
+   setup = true;
+   make_parent_ready(); 
+   setup = false;
+   pthread_exit(NULL);
+}
+
+
 static bool fuzz(void)
 {
-    if ( !fuzzdomid )
+
+    static char* last_input = NULL;
+    fprintf(stderr, "Enter fuzz\n");
+    fprintf(stderr, "Fuzzdommid = %d\n", fuzzdomid);
+    if (no_cloning == false &&  !fuzzdomid )
         return false;
 
+    fprintf(stderr, "Vmispv = %d\n", vm_is_pv);
     if ( vm_is_pv )
     {
-        if ( xc_cloning_reset(xc, fuzzdomid) )
-            return false;
+	fprintf(stderr, "Resetting vm\n");
+        if (no_cloning == false) {
+        	if ( xc_cloning_reset(xc, fuzzdomid) )
+            		return false;
+	}
     }
     else
     if ( xc_memshr_fork_reset(xc, fuzzdomid) )
         return false;
 
+	
     crash = 0;
 
     if ( afl )
@@ -107,6 +210,16 @@ static bool fuzz(void)
 
     get_input();
 
+
+    if ( last_input == NULL ) {
+	last_input = malloc((strlen(input)  + 1) * sizeof(unsigned char));
+   	if (last_input == NULL) {
+       		fprintf(stderr, "Malloc failed\n");
+      		 return false;
+    	}
+    	strcpy(last_input, input);
+    }
+   
     if ( !start_trace(vmi, start_rip) )
         return false;
     if ( !inject_input(vmi) )
@@ -115,9 +228,9 @@ static bool fuzz(void)
         return false;
     }
 
-    if ( debug ) printf("Starting fuzz loop\n");
+    if ( debug ) fprintf(stderr, "Starting fuzz loop\n");
     loop(vmi);
-    if ( debug ) printf("Stopping fuzz loop.\n");
+    if ( debug ) fprintf(stderr, "Stopping fuzz loop.\n");
 
     if ( ptcov )
         decode_pt();
@@ -132,7 +245,7 @@ static bool fuzz(void)
     vmi_symcache_flush(vmi);
 
     bool ret = false;
-
+    fprintf(stderr, "Crash = %s\n", crash ? "yes" : "no");
     if ( afl )
     {
         afl_report(crash);
@@ -146,13 +259,123 @@ static bool fuzz(void)
             fwrite(input, input_size, 1, f);
             fclose(f);
             ret = false;
+	    close_trace(vmi);
+	    vmi_destroy(vmi);
+	    xc_domain_destroy(xc, fuzzdomid);
         } else
             ret = true;
     } else
-        printf("Result: %s\n", crash ? "crash" : "no crash");
+        fprintf(stderr, "Result: %s\n", crash ? "crash" : "no crash");
 
     free(input);
     input = NULL;
+
+    if (crash == false) {
+      free(last_input);
+      last_input = NULL;
+    }
+
+    fprintf(stderr, "After copy %d\n", no_cloning);
+    if (no_cloning == true) {
+	xc_dominfo_t dominfo;
+	int rc;
+	rc = xc_domain_getinfo(xc, domid, 1, &dominfo);
+	// if no, something wrong happened
+	if (rc < 0) {
+	   fprintf(stderr, "xc_domain_getinfo\n");
+	   return false;
+	} else {
+	   close_trace(vmi);
+	   vmi_destroy(vmi);
+
+	   char buffer[1000] = {};
+	   struct timespec start, stop;
+	   double time_elapsed;
+
+	   sprintf(buffer, "xl destroy %d\n", domid);
+	   system(buffer);
+
+	   memset(buffer, 0, 1000);
+	   sprintf(buffer, "xl create -q -e /root/radu/test/apps/fuzz/fuzz/config-fuzz-app &\n");
+	   system(buffer);
+
+
+	   //memset(buffer, 0, 1000);
+	   //sprintf(buffer, "sleep 4\n");
+	   //system(buffer);
+
+	   if (clock_gettime(CLOCK_REALTIME, &start) == -1) {
+	     fprintf(stderr, "Failed to retrieve start time\n");
+	   }
+
+	   wait_ready();
+
+	  
+	   if (clock_gettime(CLOCK_REALTIME, &stop) == -1) {
+	      fprintf(stderr, "Failed to retrieve end time\n");	
+	   }
+
+	   time_elapsed = (stop.tv_sec - start.tv_sec) + ( stop.tv_nsec - start.tv_nsec )
+	               / 1000000000.0;
+
+           fprintf(stderr, "While lasted %lf\n", time_elapsed);
+
+
+	   //memset(buffer, 0, 1000);
+	   //sprintf(buffer, "sleep 4\n");
+	   //system(buffer);
+
+
+
+	   //setup = true;
+	   //domid = domid + 1;
+           //make_parent_ready(); 
+           //setup = false;
+
+
+           pthread_attr_t attr;
+	   pthread_t thread;
+
+           pthread_attr_init(&attr);
+	   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	   pthread_create(&thread, &attr, &setup_vm, NULL);
+	   pthread_attr_destroy(&attr);
+
+
+           
+           memset(buffer, 0, 1000);
+	   sprintf(buffer, "xenstore-write /local/domain/%d/data/trigger-harness done\n", domid + 1);
+	   system(buffer);
+
+
+	   usleep(20000);
+
+	   //memset(buffer, 0, 1000);
+	   //sprintf(buffer, "sleep 1\n");
+	   //system(buffer);   
+	  
+//	   domid = fuzzdomid + 1;
+
+           // setup = true;
+    	   // make_parent_ready(); 
+   	   // setup = false;
+
+
+           domid = domid + 1;
+	   fuzzdomid = domid;
+	   sinkdomid = domid;
+	   xc_domain_fuzzing_enable(xc, domid); 
+	   make_parent_ready();
+	   make_sink_ready();
+	   make_fuzz_ready();
+	}
+	//domid = 0;
+	//make_parent_ready();
+	//xc_domain_fuzzing_enable(xc, domid);
+	//make_sink_ready();
+	//make_fuzz_ready();
+    }
+
 
     return ret;
 }
@@ -214,6 +437,7 @@ static void usage(void)
     printf("\t  --sink-vaddr <virtual address>\n");
     printf("\t  --sink-paddr <physical address>\n");
     printf("\t  --record-codecov <path to save file>\n");
+    printf("\t  --no-cloning (only for Unikraft\n");
 
     printf("\n\n");
     printf("Optional global inputs:\n");
@@ -225,6 +449,7 @@ int main(int argc, char** argv)
 {
     char *logfile = NULL;
     int c, out = 0, long_index = 0;
+    printf("test rn\n");
     const struct option long_opts[] =
     {
         {"help", no_argument, NULL, 'h'},
@@ -254,13 +479,17 @@ int main(int argc, char** argv)
         {"record-codecov", required_argument, NULL, 'R'},
         {"record-memaccess", required_argument, NULL, 'M'},
         {"os", required_argument, NULL, 'o'},
+	{"no-cloning", no_argument, NULL, 'z'},
         {NULL, 0, NULL, 0}
     };
-    const char* opts = "d:i:j:f:a:l:F:H:S:m:n:V:P:R:M:svchtOKNDo:";
+    const char* opts = "d:i:j:f:a:l:F:H:S:m:n:V:P:R:M:zsvchtOKNDo:";
     limit = ~0;
     unsigned long refork = 0;
     bool keep = false;
     bool default_magic_mark = true;
+
+
+    debug = true;
 
     address = 0;
     magic_mark = 0;
@@ -271,6 +500,7 @@ int main(int argc, char** argv)
 
     while ((c = getopt_long (argc, argv, opts, long_opts, &long_index)) != -1)
     {
+    	printf("char is %c\n", c);
         switch(c)
         {
         case 'd':
@@ -326,6 +556,10 @@ int main(int argc, char** argv)
         case 't':
             ptcov = true;
             break;
+	case 'z': // Unikraft no cloning
+	    no_cloning = true;
+	    //no_cloning = false;
+	    break;
         case 'D':
             doublefetch = g_slist_prepend(doublefetch, GSIZE_TO_POINTER(strtoull(optarg, NULL, 0)));
             break;
@@ -405,22 +639,25 @@ int main(int argc, char** argv)
     setup_handlers();
 
     bool parent_ready = make_parent_ready();
-
+    printf("Parent is ready from main %d\n", parent_ready);
+    printf("Setup variabile is %d\n", setup);
+	
     if ( setup )
     {
         if ( logfile ) close(out);
         return parent_ready ? 0 : -1;
     }
 
+    printf("After setup main\n");
     if ( !parent_ready )
         goto done;
 
+    printf("After parent ready main\n");
     if ( !(xc = xc_interface_open(0, 0, 0)) )
     {
         fprintf(stderr, "Failed to grab xc interface\n");
         goto done;
     }
-
     /*
      * To reduce the churn of placing the sink breakpoints into the VM fork's memory
      * for each fuzzing iteration (which requires full-page copies for each breakpoint)
@@ -431,49 +668,55 @@ int main(int argc, char** argv)
      *
      * Fuzzing is performed from a further fork made from sinkdomid, in fuzzdomid.
      */
+
+    xc_domain_fuzzing_enable(xc, domid);
+    printf("vm is pv main: %d\n", vm_is_pv);
     if ( vm_is_pv )
     {
         int rc;
+        printf("main domid is %d\n", domid);
+	if (no_cloning == false) {
+        	rc = xc_domain_fuzzing_enable(xc, domid);
+        	if (rc) {
+            		perror("Error calling xc_domain_fuzzing_enable()");
+            		goto done;
+        	}
 
-        rc = xc_domain_fuzzing_enable(xc, domid);
-        if (rc) {
-            perror("Error calling xc_domain_fuzzing_enable()");
-            goto done;
-        }
 
-        rc = xc_cloning_clone_single(xc, domid, &sinkdomid);
-        if (rc) {
-            perror("Error calling xc_cloning_clone_single()");
-            goto done;
-        }
+		rc = xc_cloning_clone_single(xc, domid, &sinkdomid);
+		if (rc) {
+		    perror("Error calling xc_cloning_clone_single()");
+		    goto done;
+		}
 
-        rc = xc_domain_fuzzing_enable(xc, sinkdomid);
-        if (rc) {
-            perror("Error calling xc_domain_fuzzing_enable()");
-            goto done;
-        }
+		rc = xc_domain_fuzzing_enable(xc, sinkdomid);
+		if (rc) {
+		    perror("Error calling xc_domain_fuzzing_enable()");
+		    goto done;
+		}
 
-        /*
-         * We need to set the sinks before forking the sink domain
-         * in order to have them on the fuzz domain by default
-         */
-        if ( !make_sink_ready() )
-        {
-            fprintf(stderr, "Seting up sinks on VM fork domid %u failed\n", sinkdomid);
-            goto done;
-        }
+		if ( !make_sink_ready() )
+		{
+		    fprintf(stderr, "Seting up sinks on VM fork domid %u failed\n", sinkdomid);
+		    goto done;
+		}
 
-        rc = xc_cloning_clone_single(xc, sinkdomid, &fuzzdomid);
-        if (rc) {
-            perror("Error calling xc_cloning_clone_single()");
-            goto done;
-        }
+		rc = xc_cloning_clone_single(xc, sinkdomid, &fuzzdomid);
+		if (rc) {
+		    perror("Error calling xc_cloning_clone_single()");
+		    goto done;
+		}
 
-        rc = xc_domain_fuzzing_enable(xc, fuzzdomid);
-        if (rc) {
-            perror("Error calling xc_domain_fuzzing_enable()");
-            goto done;
-        }
+		rc = xc_domain_fuzzing_enable(xc, fuzzdomid);
+		if (rc) {
+		    perror("Error calling xc_domain_fuzzing_enable()");
+		    goto done;
+		}	
+	} else {
+		sinkdomid = domid;
+		fuzzdomid = domid;
+	}
+
     }
     else
     {
@@ -491,6 +734,7 @@ int main(int argc, char** argv)
     }
 
     afl_setup();
+    printf("after afl setup\n");
 
     if ( !afl )
     {
@@ -501,13 +745,17 @@ int main(int argc, char** argv)
             goto done;
         }
         fclose(input_file); // Closing for now, will reopen when needed
+        
 
-        printf("Fork VMs created: %u -> %u -> %u\n", domid, sinkdomid, fuzzdomid);
-    }
+	if (no_cloning == false) {
+		printf("Fork VMs created: %u -> %u -> %u\n", domid, sinkdomid, fuzzdomid);
+	}
+     }
 
     input_file = NULL;
 
-    if ( !vm_is_pv )
+
+    printf("no_cloning = %d\n", no_cloning);
     if ( !make_sink_ready() )
     {
         fprintf(stderr, "Seting up sinks on VM fork domid %u failed\n", sinkdomid);
@@ -520,7 +768,7 @@ int main(int argc, char** argv)
         goto done;
     }
 
-    if ( !make_fuzz_ready() )
+    if (!make_fuzz_ready() )
     {
         fprintf(stderr, "Seting up fuzzing on VM fork domid %u failed\n", fuzzdomid);
         goto done;
@@ -549,11 +797,16 @@ int main(int argc, char** argv)
             }
         }
 
+	 
+        printf("Completed %lu iterations and refork is %ld \n", iter - cycle, refork);
         if ( iter == refork )
         {
+	    printf("Iter == refork\n");
             close_trace(vmi);
             vmi_destroy(vmi);
-            xc_domain_destroy(xc, fuzzdomid);
+	    if (no_cloning == false) {
+		xc_domain_destroy(xc, fuzzdomid);
+	    }
 
             iter = 0;
             fuzzdomid = 0;
@@ -565,13 +818,15 @@ int main(int argc, char** argv)
 
     close_trace(vmi);
     vmi_destroy(vmi);
+    fprintf(stderr, "Called vmi_destroy\n");
 
 done:
+    printf("reached done\n");
     if ( ptcov )
         close_pt();
-    if ( fuzzdomid && !keep )
+    if ( fuzzdomid && !keep  && no_cloning == false)
         xc_domain_destroy(xc, fuzzdomid);
-    if ( sinkdomid && !keep )
+    if ( sinkdomid && !keep && no_cloning == false)
         xc_domain_destroy(xc, sinkdomid);
 
     if ( sink_list )
@@ -591,5 +846,7 @@ done:
     if ( logfile )
         close(out);
 
+    
+    xs_close(handle);
     return 0;
 }

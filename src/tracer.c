@@ -41,15 +41,17 @@ int pv_cow(vmi_instance_t vmi, uint32_t domid, addr_t vaddr, addr_t *paddr)
     unsigned long new_mfn;
     page_info_t info;
     int rc;
-
-    rc = xc_cloning_cow(xc, domid, (void *) vaddr, &new_mfn);
-    if ( rc && errno != ESRCH )
-    {
-        fprintf(stderr, "Error calling xc_cloning_cow() rc=%d errno=%d\n",
-                rc, errno);
-        goto out;
-    }
-
+    // TODO: if cloning
+    if (no_cloning == false) {
+    	rc = xc_cloning_cow(xc, domid, (void *) vaddr, &new_mfn);
+    	if ( rc && errno != ESRCH )
+    	{
+        	fprintf(stderr, "Error calling xc_cloning_cow() rc=%d errno=%d\n",
+                	rc, errno);
+        	goto out;
+   	 }
+     }
+    // TODO: move if in another fuunction and call it instead of pvcow; call without calling xc_cloning_cow for no_cloning
     if ( paddr )
     {
         rc = vmi_pagetable_lookup_extended(vmi, target_pagetable, vaddr, &info);
@@ -73,8 +75,10 @@ out:
 
 static void breakpoint_next_cf(vmi_instance_t vmi)
 {
-    if ( xen_is_pv(vmi) )
-    {
+    if ( xen_is_pv(vmi) && no_cloning == false)
+    {	
+    	// TODO: if xen_is_pv && cloning = true
+	// REMEMBER: xen_is_pv = 1
         if ( VMI_SUCCESS != pv_cow(vmi, fuzzdomid, next_cf_vaddr, &next_cf_paddr) )
             return;
     }

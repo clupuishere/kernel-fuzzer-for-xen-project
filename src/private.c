@@ -17,6 +17,7 @@ bool afl;
 bool parent_ready;
 bool crash;
 bool setup;
+bool no_cloning;
 bool debug;
 bool loopmode;
 bool nocov;
@@ -45,6 +46,7 @@ unsigned int magic_mark;
 uint8_t start_byte;
 
 csh cs_handle;
+struct xs_handle* handle;
 
 bool builtin_list;
 GSList *sink_list;
