@@ -4,6 +4,7 @@
  */
 
 #include "private.h"
+#include <arpa/inet.h>
 
 #if defined(FZ_LINUX)
 #include <errno.h>
@@ -19,11 +20,89 @@
 #define GET_TIME(start) (clock_gettime(CLOCK_REALTIME, &(start)))
 #define TIME_DIFF(start, stop) ((stop.tv_sec - start.tv_sec) + ( stop.tv_nsec - start.tv_nsec )/ 1000000000.0);
 
+
+static pthread_mutex_t mutex;
+static pthread_cond_t cond;
+static int ok;
+static pthread_t setup_thread;
+static pthread_t network_thread;
+
+static struct timespec vm_create_time;
+
+/* void* wait_network(__attribute__((unused)) void *arg)
+{
+
+   static int port = 8888;
+   char client_buf[BUFSIZ / 8];
+   int server_fd, client_fd;
+   struct sockaddr_in server_addr, client_addr;
+   socklen_t client_len = sizeof(client_addr);
+
+   server_fd = socket(PF_INET, SOCK_STREAM, 0);
+   memset(&server_addr, 0, sizeof(server_addr));
+
+   server_addr.sin_family = AF_INET;
+   server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+   server_addr.sin_port = htons(port);
+
+   int opt_val = 1;
+   setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt_val, sizeof(opt_val));
+
+   if (bind(server_fd, (struct sockaddr*) &server_addr, sizeof(server_addr)) < 0) {
+       fprintf(stderr, "Could not bind socket\n");
+   }
+
+   if (listen(server_fd, 2) < 0 ) {
+       fprintf(stderr, "Could not listen on socket\n");
+   }
+   fprintf(stderr, "Server is listening on %d\n", port);
+
+   fd_set fds;
+   FD_ZERO(&fds);
+   FD_SET(server_fd, &fds);
+   int max_fd = server_fd;
+
+  while (1) {
+     fd_set read_fds = fds;
+     int rc = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+     if (rc == -1) {
+          fprintf(stderr, "select failed\n");
+     }
+				        
+     for (int i = 0; i <= max_fd; ++i) {
+          if (FD_ISSET(i, &read_fds)) {
+            fprintf(stderr, "fd = %d\n", i);
+            if (i == server_fd) {
+               client_fd = accept(server_fd, (struct sockaddr*) &client_addr, &client_len);
+               FD_SET(client_fd, &fds);
+               if (client_fd > max_fd) {
+                  max_fd = client_fd;
+               }
+            } else {
+	      struct timespec end_time;
+	      int bytes = recv(i, &end_time, sizeof(end_time), 0);
+	      if (bytes <= 0) {
+	          close(i);
+	          FD_CLR(i, &fds);
+	          continue;
+	      }
+	      double time_diff = TIME_DIFF(vm_create_time, end_time);
+	      fprintf(stderr, "time network %lfms\n", time_diff * 1000);
+            }
+	}	
+     }
+   }
+
+   pthread_exit(NULL);
+} */
+
+
 static int wait_ready(void)
 {
    struct timespec start, stop;
    int rc;
-   static const char* data_path = "/data/ready-path";
+   static const char* data_path = "/data/trigger-harness";
+   int id = domid;
 
    if (handle == NULL) {
 	handle = xs_open(0);
@@ -33,7 +112,7 @@ static int wait_ready(void)
          }
    }
 
-   char* path = xs_get_domain_path(handle, domid + 1);
+   char* path = xs_get_domain_path(handle, id);
    if (!path) {
       fprintf(stderr, "xs_domain_path() failed\n");
       return -1;
@@ -47,8 +126,9 @@ static int wait_ready(void)
 
    path = tmp;
    strcat(path, data_path);
+   fprintf(stderr, "Watching %s\n", path);
     
-   rc = xs_watch(handle, path, "done");
+   rc = xs_watch(handle, path, "ready");
    int fd = xs_fileno(handle);
    fd_set set;
    int num_strings;
@@ -61,22 +141,39 @@ static int wait_ready(void)
 	 if (select(fd + 1, &set, NULL, NULL, NULL) > 0 && FD_ISSET(fd, &set)) {
 	   GET_TIME(stop);
 	   double  time_diff = TIME_DIFF(start, stop);
-	   fprintf(stderr, "select time %lf\n", time_diff);
+	   //fprintf(stderr, "select time %lfms\n", time_diff * 1000);
            vec = xs_read_watch(handle, &num_strings);
 	   if (!vec) {
 		fprintf(stderr, "xs_read_watch failed\n");
 	   }
 	   
-	   //xs_transaction_t th;
 	   unsigned int len;
-	   //th = xs_transaction_start(handle);
 	   char *buf = xs_read(handle, XBT_NULL, vec[XS_WATCH_PATH], &len);
 	   if (buf) {
-		if (!strcmp(buf, "done")) {
+		if (!strcmp(buf, "ready")) {
+		  char seconds_buf[100];
+		  char nseconds_buf[100];
+			
+		  sprintf(seconds_buf, "/local/domain/%d/data/seconds", id);	  
+		  sprintf(nseconds_buf, "/local/domain/%d/data/nseconds", id);	  
+
+		  char* seconds = xs_read(handle, XBT_NULL, seconds_buf, &len);
+		  char* nseconds = xs_read(handle, XBT_NULL, nseconds_buf, &len);
+		  struct timespec vm_start;
+		  sscanf(seconds, "%lu", &vm_start.tv_sec);
+		  sscanf(nseconds, "%lu", &vm_start.tv_nsec);
+
+		  fprintf(stderr, "%lu and %lu\n", vm_start.tv_sec, vm_start.tv_nsec);
+
+		  time_diff = TIME_DIFF(vm_create_time, vm_start);
+		  fprintf(stderr, "time xenstore %lfms\n", time_diff * 1000);
+		  free(seconds);
+		  free(nseconds);
 		  break;
 		}
 	   }
-	   //xs_transaction_end(handle, th, false);
+	   free(buf);
+
 	 }
 
    }
@@ -169,17 +266,35 @@ static bool make_fuzz_ready()
 }
 
 static void* setup_vm(__attribute__((unused)) void *arg) {
-   setup = true;
-   make_parent_ready(); 
-   setup = false;
-   pthread_exit(NULL);
+
+    while(1) {
+	pthread_mutex_lock(&mutex);
+	while (ok == 0) {
+		pthread_cond_wait(&cond, &mutex);
+	}
+	
+	if (ok == 2) {
+		break;
+	}
+	
+	setup = true;
+   	make_parent_ready(); 
+  	setup = false;
+	ok = 0;
+	pthread_cond_signal(&cond);
+	pthread_mutex_unlock(&mutex);
+
+   }
+   //setup = true;
+   //make_parent_ready(); 
+  // setup = false;
+  pthread_exit(NULL);
 }
 
 
 static bool fuzz(void)
 {
 
-    static char* last_input = NULL;
     fprintf(stderr, "Enter fuzz\n");
     fprintf(stderr, "Fuzzdommid = %d\n", fuzzdomid);
     if (no_cloning == false &&  !fuzzdomid )
@@ -210,16 +325,6 @@ static bool fuzz(void)
 
     get_input();
 
-
-    if ( last_input == NULL ) {
-	last_input = malloc((strlen(input)  + 1) * sizeof(unsigned char));
-   	if (last_input == NULL) {
-       		fprintf(stderr, "Malloc failed\n");
-      		 return false;
-    	}
-    	strcpy(last_input, input);
-    }
-   
     if ( !start_trace(vmi, start_rip) )
         return false;
     if ( !inject_input(vmi) )
@@ -270,11 +375,6 @@ static bool fuzz(void)
     free(input);
     input = NULL;
 
-    if (crash == false) {
-      free(last_input);
-      last_input = NULL;
-    }
-
     fprintf(stderr, "After copy %d\n", no_cloning);
     if (no_cloning == true) {
 	xc_dominfo_t dominfo;
@@ -293,32 +393,32 @@ static bool fuzz(void)
 	   double time_elapsed;
 
 	   sprintf(buffer, "xl destroy %d\n", domid);
-	   system(buffer);
+	   while (xc_domain_getinfo(xc, domid, 1, &dominfo) > 0) {
+	   	system(buffer);
+	   }
+	   domid = domid + 1;
 
 	   memset(buffer, 0, 1000);
 	   sprintf(buffer, "xl create -q -e /root/radu/test/apps/fuzz/fuzz/config-fuzz-app &\n");
+	   GET_TIME(vm_create_time);
+	   
 	   system(buffer);
+
+           //fprintf(stderr, "time-xl-create:%lf\nms", time_elapsed * 1000);
 
 
 	   //memset(buffer, 0, 1000);
 	   //sprintf(buffer, "sleep 4\n");
 	   //system(buffer);
 
-	   if (clock_gettime(CLOCK_REALTIME, &start) == -1) {
-	     fprintf(stderr, "Failed to retrieve start time\n");
-	   }
-
+	   GET_TIME(start);
 	   wait_ready();
-
+	   GET_TIME(stop);
 	  
-	   if (clock_gettime(CLOCK_REALTIME, &stop) == -1) {
-	      fprintf(stderr, "Failed to retrieve end time\n");	
-	   }
 
-	   time_elapsed = (stop.tv_sec - start.tv_sec) + ( stop.tv_nsec - start.tv_nsec )
-	               / 1000000000.0;
+	   time_elapsed = TIME_DIFF(start, stop);
 
-           fprintf(stderr, "While lasted %lf\n", time_elapsed);
+           fprintf(stderr, "time-while:%lf\n", time_elapsed * 1000);
 
 
 	   //memset(buffer, 0, 1000);
@@ -331,27 +431,33 @@ static bool fuzz(void)
 	   //domid = domid + 1;
            //make_parent_ready(); 
            //setup = false;
+	   //fprintf(stderr, "after setup\n");
+	   pthread_mutex_lock(&mutex);	
+	   while (ok == 1) {
+		pthread_cond_wait(&cond, &mutex);
+	   }
+	   ok = 1;
+	   pthread_cond_signal(&cond);
+	   pthread_mutex_unlock(&mutex);
 
 
-           pthread_attr_t attr;
-	   pthread_t thread;
+           //pthread_attr_t attr;
+	   //pthread_t thread;
 
-           pthread_attr_init(&attr);
-	   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-	   pthread_create(&thread, &attr, &setup_vm, NULL);
-	   pthread_attr_destroy(&attr);
+	   //pthread_attr_init(&attr);
+	   //pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+           //pthread_create(&thread, &attr, &setup_vm, NULL);
+	   //pthread_attr_destroy(&attr);
 
-
-           
+                     
            memset(buffer, 0, 1000);
-	   sprintf(buffer, "xenstore-write /local/domain/%d/data/trigger-harness done\n", domid + 1);
+	   sprintf(buffer, "xenstore-write /local/domain/%d/data/trigger-harness done\n", domid);
 	   system(buffer);
 
-
-	   usleep(20000);
+	  // usleep(20000);
 
 	   //memset(buffer, 0, 1000);
-	   //sprintf(buffer, "sleep 1\n");
+	   //sprintf(buffer, "sleep 2\n");
 	   //system(buffer);   
 	  
 //	   domid = fuzzdomid + 1;
@@ -359,9 +465,14 @@ static bool fuzz(void)
            // setup = true;
     	   // make_parent_ready(); 
    	   // setup = false;
+	   pthread_mutex_lock(&mutex);	
+	   while (ok == 1) {
+		pthread_cond_wait(&cond, &mutex);
+	   }
+	   pthread_cond_signal(&cond);
+	   pthread_mutex_unlock(&mutex);
 
 
-           domid = domid + 1;
 	   fuzzdomid = domid;
 	   sinkdomid = domid;
 	   xc_domain_fuzzing_enable(xc, domid); 
@@ -782,6 +893,24 @@ int main(int argc, char** argv)
 
     unsigned long iter = 0, t = time(0), cycle = 0;
 
+
+    if (no_cloning) {
+    	 int rc;
+	 rc = pthread_mutex_init(&mutex, NULL);
+	 if (rc == -1) {
+		 fprintf(stderr, "pthread_mutex_init failed\n");
+		 return -1;
+	 }
+	 rc = pthread_cond_init(&cond, NULL);
+         if (rc == -1) {
+               fprintf(stderr, "pthread_cond_init failed\n");
+               return -1;
+         }
+
+    	pthread_create(&setup_thread, NULL, &setup_vm, NULL);
+	// pthread_create(&network_thread, NULL, &wait_network, NULL);
+    }
+    
     while ( fuzz() )
     {
         iter++;
@@ -848,5 +977,20 @@ done:
 
     
     xs_close(handle);
-    return 0;
+
+    if (no_cloning) {
+      	pthread_mutex_lock(&mutex);
+    	if (ok == 1) {
+        	pthread_cond_wait(&cond, &mutex);
+    	}
+    	ok = 2;
+    	pthread_cond_signal(&cond);
+    	pthread_mutex_unlock(&mutex);
+
+    	pthread_join(setup_thread, NULL);
+	//pthread_join(network_thread, NULL);
+    	pthread_mutex_destroy(&mutex);
+    	pthread_cond_destroy(&cond);
+    }
+       return 0;
 }
