@@ -27,6 +27,8 @@ static int ok;
 static pthread_t setup_thread;
 static pthread_t network_thread;
 
+static char* vm_json_path = NULL;
+
 static struct timespec vm_create_time;
 
 /* void* wait_network(__attribute__((unused)) void *arg)
@@ -399,7 +401,8 @@ static bool fuzz(void)
 	   domid = domid + 1;
 
 	   memset(buffer, 0, 1000);
-	   sprintf(buffer, "xl create -q -e /root/radu/test/apps/fuzz/fuzz/config-fuzz-app &\n");
+	   sprintf(buffer, "xl create -q -e %s\n", vm_json_path);
+	   fprintf(stderr, "buffer is %s\n", buffer);
 	   GET_TIME(vm_create_time);
 	   
 	   system(buffer);
@@ -590,10 +593,10 @@ int main(int argc, char** argv)
         {"record-codecov", required_argument, NULL, 'R'},
         {"record-memaccess", required_argument, NULL, 'M'},
         {"os", required_argument, NULL, 'o'},
-	{"no-cloning", no_argument, NULL, 'z'},
+	{"no-cloning", required_argument, NULL, 'z'},
         {NULL, 0, NULL, 0}
     };
-    const char* opts = "d:i:j:f:a:l:F:H:S:m:n:V:P:R:M:zsvchtOKNDo:";
+    const char* opts = "d:i:j:f:a:l:F:H:S:m:n:V:P:R:M:z:svchtOKNDo:";
     limit = ~0;
     unsigned long refork = 0;
     bool keep = false;
@@ -670,6 +673,7 @@ int main(int argc, char** argv)
 	case 'z': // Unikraft no cloning
 	    no_cloning = true;
 	    //no_cloning = false;
+	    vm_json_path = strdup(optarg);
 	    break;
         case 'D':
             doublefetch = g_slist_prepend(doublefetch, GSIZE_TO_POINTER(strtoull(optarg, NULL, 0)));
@@ -992,5 +996,7 @@ done:
     	pthread_mutex_destroy(&mutex);
     	pthread_cond_destroy(&cond);
     }
+
+       free(vm_json_path);
        return 0;
 }
